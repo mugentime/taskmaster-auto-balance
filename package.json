@@ -1,0 +1,33 @@
+{
+  "name": "taskmaster-auto-balance",
+  "version": "1.0.0",
+  "description": "TaskMaster - Automated Balance Management System for Trading Bots",
+  "main": "enhanced-taskmaster.js",
+  "scripts": {
+    "start": "node enhanced-taskmaster.js",
+    "dev": "node enhanced-taskmaster.js --fast",
+    "server": "node server.js",
+    "balance-check": "node auto-balance-manager.js",
+    "portfolio": "node full-portfolio-valuation.js",
+    "test-notifications": "node balance-notifications.js --test"
+  },
+  "keywords": [
+    "trading",
+    "binance",
+    "automation",
+    "balance-management",
+    "funding-arbitrage"
+  ],
+  "author": "TaskMaster AI",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.11.0",
+    "binance-api-node": "^0.12.9",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
