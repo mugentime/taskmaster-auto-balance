@@ -1,18 +1,79 @@
-// Load environment variables from .env file (optional fallback)
-require('dotenv').config();
+// Load trading configuration (includes dotenv setup)
+const tradingConfig = require('../config/trading.cjs');
 
 const express = require('express');
 const cors = require('cors');
+const AutomationEngine = require('./automation-engine.js');
+const BalanceNotificationManager = require('./balance-notifications.js');
+const MarketDataService = require('./services/MarketDataService');
+
+// Global automation engine instance
+let automationEngine = null;
+// Global notification manager instance
+const notificationManager = new BalanceNotificationManager();
+// Global market data service instance
+const marketDataService = new MarketDataService();
 const Binance = require('binance-api-node').default;
 const { FuturesMarginService } = require('./services/futuresMarginService');
 const { mapBinanceError, createMarginError, extractBinanceError } = require('./utils/binanceErrorMap');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-const { BINANCE_API_KEY, BINANCE_API_SECRET = process.env.BINANCE_SECRET_KEY } = process.env;
+const PORT = tradingConfig.PORT;
+const { BINANCE_API_KEY, BINANCE_API_SECRET } = tradingConfig;
 
 // --- Middleware ---
-app.use(cors());
+app.set('trust proxy', 1);
+
+// CORS configuration for development and production environments
+const isDevelopment = process.env.NODE_ENV !== 'production';
+const allowedOrigins = isDevelopment 
+    ? [
+        // Development origins
+        'http://localhost:5173',
+        'http://127.0.0.1:5173', 
+        'http://localhost:4173',
+        'http://127.0.0.1:4173',
+        'http://localhost:3000'
+      ]
+    : [
+        // Production origins - Render deployment URLs
+        process.env.FRONTEND_URL, // If set via environment variable
+        'https://taskmaster-frontend.onrender.com', // Expected frontend URL pattern
+        'https://warp-taskmaster.onrender.com', // Alternative frontend URL pattern
+        /\.onrender\.com$/, // Allow any Render domain for flexibility
+      ].filter(Boolean);
+
+console.log(`[CORS] Environment: ${isDevelopment ? 'development' : 'production'}`);
+console.log(`[CORS] Allowed origins:`, allowedOrigins);
+
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        
+        // Check if origin is allowed
+        const isAllowed = allowedOrigins.some(allowedOrigin => {
+            if (typeof allowedOrigin === 'string') {
+                return origin === allowedOrigin;
+            }
+            if (allowedOrigin instanceof RegExp) {
+                return allowedOrigin.test(origin);
+            }
+            return false;
+        });
+        
+        if (isAllowed) {
+            callback(null, true);
+        } else {
+            console.warn(`[CORS] Blocked origin: ${origin}`);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
 // --- In-Memory Database & State ---
@@ -37,9 +98,9 @@ const getBinanceClients = (apiKey = '', apiSecret = '') => {
     const client = Binance({
         apiKey,
         apiSecret,
-        testnet: false,
-        // Add timestamp offset to fix sync issues
-        getTime: () => Date.now() - 2000 // Subtract 2 seconds
+        testnet: tradingConfig.IS_TESTNET,
+        // Use centralized timestamp offset for sync issues
+        getTime: () => Date.now() + tradingConfig.TIMESTAMP_OFFSET
     });
     return { spotClient: client, futuresClient: client };
 };
@@ -3553,6 +3614,25 @@ const executeLaunch = async (id, name, symbol, strategyType, investment, leverag
                 });
                 console.log(`[SUCCESS] FUTURES SELL order executed:`, futuresOrder.orderId);
                 console.log(`[MARGIN-DIAGNOSTIC] ${correlationId}: Trade execution successful`);
+                
+                // Send position opened notification
+                try {
+                    await notificationManager.notifyPositionOpened({
+                        symbol,
+                        side: 'SHORT',
+                        quantity: validatedFuturesQuantity,
+                        entryPrice: currentPrice,
+                        leverage,
+                        notionalUSD: parseFloat(validatedFuturesQuantity) * currentPrice,
+                        botId: id,
+                        strategy: strategyType,
+                        exchange: 'BINANCE',
+                        orderId: futuresOrder.orderId,
+                        timestamp: Date.now()
+                    });
+                } catch (notifError) {
+                    console.log(`[WARNING] Position notification failed: ${notifError.message}`);
+                }
             } catch (error) {
                 const binanceError = extractBinanceError(error);
                 const mappedError = mapBinanceError(binanceError, { 
@@ -3600,6 +3680,25 @@ const executeLaunch = async (id, name, symbol, strategyType, investment, leverag
                 });
                 console.log(`[SUCCESS] FUTURES BUY order executed:`, futuresOrder.orderId);
                 console.log(`[MARGIN-DIAGNOSTIC] ${correlationId}: Trade execution successful`);
+                
+                // Send position opened notification
+                try {
+                    await notificationManager.notifyPositionOpened({
+                        symbol,
+                        side: 'LONG',
+                        quantity: validatedFuturesQuantity,
+                        entryPrice: currentPrice,
+                        leverage,
+                        notionalUSD: parseFloat(validatedFuturesQuantity) * currentPrice,
+                        botId: id,
+                        strategy: strategyType,
+                        exchange: 'BINANCE',
+                        orderId: futuresOrder.orderId,
+                        timestamp: Date.now()
+                    });
+                } catch (notifError) {
+                    console.log(`[WARNING] Position notification failed: ${notifError.message}`);
+                }
             } catch (error) {
                 const binanceError = extractBinanceError(error);
                 const mappedError = mapBinanceError(binanceError, { 
@@ -3638,11 +3737,46 @@ const executeStop = async (botId, apiKey, apiSecret) => {
     const { spotClient, futuresClient } = getBinanceClients(apiKey, apiSecret);
     const positions = await futuresClient.getPositionRisk({ symbol: botToStop.symbol });
     const openPosition = positions.data.find(p => parseFloat(p.positionAmt) !== 0);
-
+    
+    let positionData = null;
+    
     if (openPosition) {
         const quantity = Math.abs(parseFloat(openPosition.positionAmt));
         const sideToClose = openPosition.positionAmt > 0 ? 'SELL' : 'BUY';
-        await futuresClient.newOrder(botToStop.symbol, sideToClose, 'MARKET', { quantity });
+        const positionSide = openPosition.positionAmt > 0 ? 'LONG' : 'SHORT';
+        const entryPrice = parseFloat(openPosition.entryPrice);
+        const unrealizedProfit = parseFloat(openPosition.unRealizedProfit);
+        const markPrice = parseFloat(openPosition.markPrice);
+        
+        // Calculate duration
+        const duration = botToStop.startTime ? 
+            new Date(Date.now() - botToStop.startTime).toISOString().substr(11, 8) : 'Unknown';
+        
+        // Calculate ROI
+        const notionalValue = quantity * entryPrice;
+        const roiPct = notionalValue > 0 ? (unrealizedProfit / notionalValue) * 100 : 0;
+        
+        positionData = {
+            symbol: botToStop.symbol,
+            side: positionSide,
+            quantity: quantity.toString(),
+            entryPrice,
+            exitPrice: markPrice,
+            leverage: botToStop.leverage || 1,
+            notionalUSD: notionalValue,
+            realizedPnlUSD: unrealizedProfit,
+            roiPct,
+            duration,
+            reason: 'Manual Stop',
+            botId,
+            exchange: 'BINANCE',
+            timestamp: Date.now()
+        };
+        
+        const closeOrder = await futuresClient.newOrder(botToStop.symbol, sideToClose, 'MARKET', { quantity });
+        if (closeOrder.orderId) {
+            positionData.orderId = closeOrder.orderId;
+        }
     }
     
     const priceResponse = await spotClient.tickerPrice(botToStop.symbol);
@@ -3650,6 +3784,15 @@ const executeStop = async (botId, apiKey, apiSecret) => {
     const spotQuantity = (botToStop.investment / 2 / currentPrice).toFixed(5);
     const spotSideToClose = botToStop.strategyType === 'Short Perp' ? 'SELL' : 'BUY';
     await spotClient.newOrder(botToStop.symbol, spotSideToClose, 'MARKET', { quantity: spotQuantity });
+    
+    // Send position closed notification if we had an open position
+    if (positionData) {
+        try {
+            await notificationManager.notifyPositionClosed(positionData);
+        } catch (notifError) {
+            console.log(`[WARNING] Position close notification failed: ${notifError.message}`);
+        }
+    }
     
     delete activeBots[botId];
     console.log(`[✔] Bot ${botToStop.name} stopped and positions closed.`);
@@ -3812,6 +3955,116 @@ app.get('/api/v1/arbitrage-opportunities', async (req, res) => {
 });
 
 // Get funding rate for specific symbol
+// --- MARKET DATA SERVICE ENDPOINTS ---
+
+// Get live market data service status
+app.get('/api/v1/market-data/status', async (req, res) => {
+    try {
+        const status = marketDataService.getConnectionStatus();
+        const stats = marketDataService.getStatistics();
+        
+        res.json({
+            success: true,
+            status,
+            stats,
+            isRunning: marketDataService.isConnected
+        });
+    } catch (error) {
+        console.error('[API] Market data status error:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get market data status',
+            error: error.message
+        });
+    }
+});
+
+// Get real-time funding rates from MarketDataService
+app.get('/api/v1/market-data/funding-rates', async (req, res) => {
+    try {
+        const { threshold = 0.001, limit = 50 } = req.query;
+        
+        const allRates = marketDataService.getAllFundingRates();
+        const highRates = marketDataService.getHighFundingRates(parseFloat(threshold));
+        
+        // Sort and limit results
+        const limitedRates = allRates
+            .sort((a, b) => Math.abs(b.fundingRate) - Math.abs(a.fundingRate))
+            .slice(0, parseInt(limit));
+        
+        res.json({
+            success: true,
+            data: {
+                allRates: limitedRates,
+                highRates: highRates.slice(0, parseInt(limit)),
+                summary: {
+                    totalSymbols: allRates.length,
+                    highFundingCount: highRates.length,
+                    threshold: parseFloat(threshold),
+                    maxFundingRate: allRates.length > 0 ? Math.max(...allRates.map(r => Math.abs(r.fundingRate))) : 0,
+                    averageFundingRate: allRates.length > 0 ? allRates.reduce((sum, r) => sum + Math.abs(r.fundingRate), 0) / allRates.length : 0
+                }
+            },
+            lastUpdate: marketDataService.lastUpdate,
+            connected: marketDataService.isConnected
+        });
+    } catch (error) {
+        console.error('[API] Market data funding rates error:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get funding rates from market data service',
+            error: error.message
+        });
+    }
+});
+
+// Get specific symbol funding rate from MarketDataService
+app.get('/api/v1/market-data/funding-rates/:symbol', async (req, res) => {
+    try {
+        const { symbol } = req.params;
+        const symbolUpper = symbol.toUpperCase();
+        
+        if (!symbolUpper.endsWith('USDT')) {
+            return res.status(400).json({
+                success: false,
+                message: 'Only USDT perpetual symbols are supported'
+            });
+        }
+        
+        const symbolData = marketDataService.getFundingRate(symbolUpper);
+        
+        if (!symbolData) {
+            return res.status(404).json({
+                success: false,
+                message: `Symbol ${symbol} not found in market data`,
+                availableSymbols: marketDataService.monitoredSymbols ? Array.from(marketDataService.monitoredSymbols).slice(0, 10) : []
+            });
+        }
+        
+        // Add additional calculated metrics
+        const enhancedData = {
+            ...symbolData,
+            fundingRatePercent: (symbolData.fundingRate * 100).toFixed(4),
+            annualizedRate: (Math.abs(symbolData.fundingRate) * 365 * 3 * 100).toFixed(2),
+            nextFundingFormatted: new Date(symbolData.nextFundingTime).toISOString(),
+            ageMinutes: Math.floor((Date.now() - symbolData.timestamp) / (1000 * 60))
+        };
+        
+        res.json({
+            success: true,
+            data: enhancedData,
+            connected: marketDataService.isConnected
+        });
+    } catch (error) {
+        console.error(`[API] Market data symbol ${symbol} error:`, error.message);
+        res.status(500).json({
+            success: false,
+            message: `Failed to get market data for ${symbol}`,
+            error: error.message
+        });
+    }
+});
+
 app.get('/api/v1/funding-rates/:symbol', async (req, res) => {
     try {
         const { symbol } = req.params;
@@ -3902,13 +4155,788 @@ app.get('/api/v1/funding-rates/monitor-status', (req, res) => {
     });
 });
 
-app.listen(PORT, () => {
+// Endpoint para obtener balance total real valorizado
+app.post('/api/v1/get-real-total-balance', async (req, res) => {
+    const { apiKey, apiSecret } = req.body;
+    
+    if (!apiKey || !apiSecret) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'API keys are required' 
+        });
+    }
+
+    try {
+        console.log('[BALANCE] Getting real total balance...');
+        
+        const { spotClient, futuresClient } = getBinanceClients(apiKey, apiSecret);
+
+        const results = {
+            spot: null,
+            futures: null,
+            margin: null,
+            total: {
+                totalWalletBalance: 0,
+                totalMarginBalance: 0,
+                totalUnrealizedProfit: 0
+            }
+        };
+
+        // 1. Obtener balance de Spot
+        try {
+            console.log('[BALANCE] Fetching spot account...');
+            const spotAccount = await spotClient.accountInfo();
+            let spotTotal = 0;
+            const spotBalances = {};
+            
+            for (const balance of spotAccount.balances) {
+                const available = parseFloat(balance.free);
+                const onOrder = parseFloat(balance.locked);
+                const total = available + onOrder;
+                
+                if (total > 0) {
+                    spotBalances[balance.asset] = {
+                        available,
+                        onOrder,
+                        total
+                    };
+                    
+                    if (balance.asset === 'USDT') {
+                        spotTotal += total;
+                    } else {
+                        // Para otros activos, necesitamos el precio en USDT
+                        try {
+                            const prices = await spotClient.prices();
+                            const pairPrice = prices[`${balance.asset}USDT`];
+                            if (pairPrice) {
+                                spotTotal += total * parseFloat(pairPrice);
+                            }
+                        } catch (priceError) {
+                            console.log(`[BALANCE] Could not get price for ${balance.asset}: ${priceError.message}`);
+                        }
+                    }
+                }
+            }
+            
+            results.spot = {
+                success: true,
+                balances: spotBalances,
+                totalUSDTValue: spotTotal
+            };
+            
+            console.log(`[BALANCE] Spot: $${spotTotal.toFixed(2)}`);
+            
+        } catch (error) {
+            results.spot = { 
+                success: false, 
+                error: error.message 
+            };
+            console.log(`[BALANCE] Spot error: ${error.message}`);
+        }
+
+        // 2. Obtener balance de Futures usando endpoint correcto /fapi/v2/account
+        try {
+            console.log('[BALANCE] Fetching USD-M futures account (/fapi/v2/account)...');
+            const futuresAccount = await futuresClient.futuresAccount();
+            
+            results.futures = {
+                success: true,
+                totalWalletBalance: parseFloat(futuresAccount.totalWalletBalance),
+                totalMarginBalance: parseFloat(futuresAccount.totalMarginBalance), 
+                totalUnrealizedProfit: parseFloat(futuresAccount.totalUnrealizedPnl || futuresAccount.totalUnrealizedProfit),
+                totalCrossWalletBalance: parseFloat(futuresAccount.totalCrossWalletBalance),
+                totalCrossUnPnl: parseFloat(futuresAccount.totalCrossUnPnl),
+                availableBalance: parseFloat(futuresAccount.availableBalance),
+                maxWithdrawAmount: parseFloat(futuresAccount.maxWithdrawAmount),
+                assets: futuresAccount.assets.filter(a => parseFloat(a.walletBalance) > 0).map(a => ({
+                    asset: a.asset,
+                    walletBalance: parseFloat(a.walletBalance),
+                    unrealizedProfit: parseFloat(a.unrealizedProfit || 0),
+                    marginBalance: parseFloat(a.marginBalance || 0),
+                    maintMargin: parseFloat(a.maintMargin || 0),
+                    initialMargin: parseFloat(a.initialMargin || 0),
+                    positionInitialMargin: parseFloat(a.positionInitialMargin || 0),
+                    openOrderInitialMargin: parseFloat(a.openOrderInitialMargin || 0),
+                    crossWalletBalance: parseFloat(a.crossWalletBalance || 0),
+                    crossUnPnl: parseFloat(a.crossUnPnl || 0),
+                    availableBalance: parseFloat(a.availableBalance || 0),
+                    maxWithdrawAmount: parseFloat(a.maxWithdrawAmount || 0),
+                    marginAvailable: a.marginAvailable || false
+                }))
+            };
+            
+            console.log(`[BALANCE] USD-M Futures: $${results.futures.totalWalletBalance.toFixed(2)} wallet, $${results.futures.availableBalance.toFixed(2)} available`);
+            
+        } catch (error) {
+            // Fallback: Try alternative futures balance endpoint /fapi/v2/balance
+            try {
+                console.log('[BALANCE] Fallback: Trying /fapi/v2/balance endpoint...');
+                const futuresBalances = await futuresClient.futuresAccountBalance();
+                
+                let totalBalance = 0;
+                const processedAssets = futuresBalances.filter(b => parseFloat(b.balance) > 0).map(b => {
+                    const balance = parseFloat(b.balance);
+                    if (b.asset === 'USDT') totalBalance += balance;
+                    return {
+                        asset: b.asset,
+                        walletBalance: balance,
+                        crossWalletBalance: parseFloat(b.crossWalletBalance || balance),
+                        availableBalance: parseFloat(b.availableBalance || balance),
+                        maxWithdrawAmount: parseFloat(b.maxWithdrawAmount || balance)
+                    };
+                });
+                
+                results.futures = {
+                    success: true,
+                    totalWalletBalance: totalBalance,
+                    totalMarginBalance: totalBalance,
+                    totalUnrealizedProfit: 0,
+                    availableBalance: totalBalance,
+                    assets: processedAssets,
+                    method: 'fallback_balance_endpoint'
+                };
+                
+                console.log(`[BALANCE] Futures (fallback): $${totalBalance.toFixed(2)}`);
+                
+            } catch (fallbackError) {
+                results.futures = { 
+                    success: false, 
+                    error: `Primary: ${error.message}, Fallback: ${fallbackError.message}`
+                };
+                console.log(`[BALANCE] Both futures endpoints failed - Primary: ${error.message}, Fallback: ${fallbackError.message}`);
+            }
+        }
+
+        // 3. Obtener balance de Margin (Cross Margin)
+        try {
+            console.log('[BALANCE] Fetching margin account...');
+            const marginAccount = await spotClient.marginAccountInfo();
+            
+            let marginTotal = 0;
+            const marginBalances = {};
+            
+            if (marginAccount.userAssets) {
+                for (const asset of marginAccount.userAssets) {
+                    const free = parseFloat(asset.free);
+                    const locked = parseFloat(asset.locked);
+                    const total = free + locked;
+                    
+                    if (total > 0) {
+                        marginBalances[asset.asset] = {
+                            free,
+                            locked, 
+                            total
+                        };
+                        
+                        if (asset.asset === 'USDT') {
+                            marginTotal += total;
+                        } else {
+                            // Para otros activos, necesitamos el precio
+                            try {
+                                const prices = await spotClient.prices();
+                                const pairPrice = prices[`${asset.asset}USDT`];
+                                if (pairPrice) {
+                                    marginTotal += total * parseFloat(pairPrice);
+                                }
+                            } catch (priceError) {
+                                console.log(`[BALANCE] Could not get margin price for ${asset.asset}`);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            results.margin = {
+                success: true,
+                balances: marginBalances,
+                totalUSDTValue: marginTotal,
+                totalNetAsset: parseFloat(marginAccount.totalNetAsset || 0)
+            };
+            
+            console.log(`[BALANCE] Margin: $${marginTotal.toFixed(2)}`);
+            
+        } catch (error) {
+            results.margin = { 
+                success: false, 
+                error: error.message 
+            };
+            console.log(`[BALANCE] Margin error: ${error.message}`);
+        }
+
+        // 4. Calcular totales
+        const spotValue = results.spot?.totalUSDTValue || 0;
+        const futuresValue = results.futures?.totalWalletBalance || 0;
+        const marginValue = results.margin?.totalUSDTValue || 0;
+        
+        results.total = {
+            totalWalletBalance: spotValue + futuresValue + marginValue,
+            totalMarginBalance: results.futures?.totalMarginBalance || 0,
+            totalUnrealizedProfit: results.futures?.totalUnrealizedProfit || 0,
+            breakdown: {
+                spot: spotValue,
+                futures: futuresValue, 
+                margin: marginValue
+            }
+        };
+
+        console.log(`[BALANCE] TOTAL REAL BALANCE: $${results.total.totalWalletBalance.toFixed(2)}`);
+
+        res.json({
+            success: true,
+            message: `Total balance calculated: $${results.total.totalWalletBalance.toFixed(2)} USDT`,
+            totalBalance: results.total.totalWalletBalance,
+            totalMarginBalance: results.total.totalMarginBalance,
+            totalUnrealizedProfit: results.total.totalUnrealizedProfit,
+            breakdown: results.total.breakdown,
+            details: results,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('[BALANCE] Total balance calculation failed:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to calculate total balance',
+            error: error.message
+        });
+    }
+});
+
+// ========================================
+// AUTOMATION ENGINE CONTROL ENDPOINTS
+// ========================================
+
+// Start automation engine
+app.post('/api/v1/automation/start', async (req, res) => {
+    try {
+        if (!automationEngine) {
+            automationEngine = new AutomationEngine();
+        }
+        
+        if (automationEngine.isRunning) {
+            return res.json({
+                success: true,
+                message: 'Automation engine is already running',
+                status: automationEngine.getStatus()
+            });
+        }
+        
+        await automationEngine.start();
+        
+        res.json({
+            success: true,
+            message: 'Automation engine started successfully',
+            status: automationEngine.getStatus()
+        });
+        
+    } catch (error) {
+        console.error('[AUTOMATION] Failed to start engine:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to start automation engine',
+            error: error.message
+        });
+    }
+});
+
+// Stop automation engine
+app.post('/api/v1/automation/stop', async (req, res) => {
+    try {
+        if (!automationEngine || !automationEngine.isRunning) {
+            return res.json({
+                success: true,
+                message: 'Automation engine is not running'
+            });
+        }
+        
+        await automationEngine.stop();
+        
+        res.json({
+            success: true,
+            message: 'Automation engine stopped successfully'
+        });
+        
+    } catch (error) {
+        console.error('[AUTOMATION] Failed to stop engine:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to stop automation engine',
+            error: error.message
+        });
+    }
+});
+
+// Get automation engine status
+app.get('/api/v1/automation/status', (req, res) => {
+    try {
+        if (!automationEngine) {
+            return res.json({
+                success: true,
+                isRunning: false,
+                message: 'Automation engine not initialized'
+            });
+        }
+        
+        const status = automationEngine.getStatus();
+        
+        res.json({
+            success: true,
+            ...status,
+            message: status.isRunning ? 'Automation engine is running' : 'Automation engine is stopped'
+        });
+        
+    } catch (error) {
+        console.error('[AUTOMATION] Failed to get status:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get automation status',
+            error: error.message
+        });
+    }
+});
+
+// Force scan for opportunities
+app.post('/api/v1/automation/scan', async (req, res) => {
+    try {
+        if (!automationEngine || !automationEngine.isRunning) {
+            return res.status(400).json({
+                success: false,
+                message: 'Automation engine is not running'
+            });
+        }
+        
+        const result = await automationEngine.scanAndLaunch();
+        
+        res.json({
+            success: true,
+            message: 'Manual scan completed',
+            result
+        });
+        
+    } catch (error) {
+        console.error('[AUTOMATION] Manual scan failed:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Manual scan failed',
+            error: error.message
+        });
+    }
+});
+
+// Update automation config
+app.post('/api/v1/automation/config', async (req, res) => {
+    try {
+        const { autoLaunch, portfolio, risk, intervals } = req.body;
+        
+        if (!automationEngine) {
+            return res.status(400).json({
+                success: false,
+                message: 'Automation engine not initialized'
+            });
+        }
+        
+        // Update config
+        if (autoLaunch) {
+            Object.assign(automationEngine.config.autoLaunch, autoLaunch);
+        }
+        if (portfolio) {
+            Object.assign(automationEngine.config.portfolio, portfolio);
+        }
+        if (risk) {
+            Object.assign(automationEngine.config.risk, risk);
+        }
+        if (intervals) {
+            Object.assign(automationEngine.config.intervals, intervals);
+        }
+        
+        res.json({
+            success: true,
+            message: 'Configuration updated successfully',
+            config: automationEngine.config
+        });
+        
+    } catch (error) {
+        console.error('[AUTOMATION] Config update failed:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to update configuration',
+            error: error.message
+        });
+    }
+});
+
+// Endpoint optimizado usando endpoints técnicos específicos de Binance
+app.post('/api/v1/get-comprehensive-balance', async (req, res) => {
+    const { apiKey, apiSecret, omitZeroBalances = true } = req.body;
+    
+    if (!apiKey || !apiSecret) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'API keys are required' 
+        });
+    }
+
+    try {
+        console.log('[COMPREHENSIVE] Getting comprehensive balance using technical endpoints...');
+        
+        const { spotClient, futuresClient } = getBinanceClients(apiKey, apiSecret);
+
+        const results = {
+            spot: null,
+            futuresUsdM: null,
+            margin: null,
+            isolatedMargin: null,
+            total: {
+                totalWalletBalance: 0,
+                totalAvailableBalance: 0,
+                totalUnrealizedProfit: 0,
+                totalMarginBalance: 0
+            },
+            metadata: {
+                timestamp: Date.now(),
+                endpoints_used: [],
+                api_weights_consumed: 0
+            }
+        };
+
+        // 1. Spot Account usando /api/v3/account (Weight: 20)
+        try {
+            console.log('[COMPREHENSIVE] Fetching Spot account (/api/v3/account, weight: 20)...');
+            const spotAccount = await spotClient.accountInfo({ omitZeroBalances });
+            
+            let spotTotalUSDT = 0;
+            const spotBalances = {};
+            
+            // Get current prices for conversion
+            const prices = await spotClient.prices();
+            
+            for (const balance of spotAccount.balances) {
+                const available = parseFloat(balance.free);
+                const locked = parseFloat(balance.locked);
+                const total = available + locked;
+                
+                if (!omitZeroBalances || total > 0) {
+                    spotBalances[balance.asset] = {
+                        free: available,
+                        locked: locked,
+                        total: total
+                    };
+                    
+                    // Convert to USDT value
+                    if (balance.asset === 'USDT') {
+                        spotTotalUSDT += total;
+                    } else if (total > 0) {
+                        const pairPrice = prices[`${balance.asset}USDT`];
+                        if (pairPrice) {
+                            const usdtValue = total * parseFloat(pairPrice);
+                            spotTotalUSDT += usdtValue;
+                            spotBalances[balance.asset].usdtValue = usdtValue;
+                            spotBalances[balance.asset].price = parseFloat(pairPrice);
+                        }
+                    }
+                }
+            }
+            
+            results.spot = {
+                success: true,
+                balances: spotBalances,
+                totalUSDTValue: spotTotalUSDT,
+                accountType: spotAccount.accountType,
+                canTrade: spotAccount.canTrade,
+                canWithdraw: spotAccount.canWithdraw,
+                canDeposit: spotAccount.canDeposit,
+                permissions: spotAccount.permissions,
+                updateTime: spotAccount.updateTime,
+                accountsCount: Object.keys(spotBalances).length
+            };
+            
+            results.metadata.endpoints_used.push({ endpoint: '/api/v3/account', weight: 20 });
+            results.metadata.api_weights_consumed += 20;
+            
+            console.log(`[COMPREHENSIVE] Spot: $${spotTotalUSDT.toFixed(2)} USDT across ${Object.keys(spotBalances).length} assets`);
+            
+        } catch (error) {
+            results.spot = { 
+                success: false, 
+                error: error.message 
+            };
+            console.log(`[COMPREHENSIVE] Spot error: ${error.message}`);
+        }
+
+        // 2. USD-M Futures usando /fapi/v2/account (Weight: 5)
+        try {
+            console.log('[COMPREHENSIVE] Fetching USD-M Futures (/fapi/v2/account, weight: 5)...');
+            const futuresAccount = await futuresClient.futuresAccount();
+            
+            const futuresAssets = futuresAccount.assets.filter(a => 
+                !omitZeroBalances || parseFloat(a.walletBalance) > 0
+            ).map(a => ({
+                asset: a.asset,
+                walletBalance: parseFloat(a.walletBalance),
+                unrealizedProfit: parseFloat(a.unrealizedProfit || 0),
+                marginBalance: parseFloat(a.marginBalance || 0),
+                maintMargin: parseFloat(a.maintMargin || 0),
+                initialMargin: parseFloat(a.initialMargin || 0),
+                positionInitialMargin: parseFloat(a.positionInitialMargin || 0),
+                openOrderInitialMargin: parseFloat(a.openOrderInitialMargin || 0),
+                crossWalletBalance: parseFloat(a.crossWalletBalance || 0),
+                crossUnPnl: parseFloat(a.crossUnPnl || 0),
+                availableBalance: parseFloat(a.availableBalance || 0),
+                maxWithdrawAmount: parseFloat(a.maxWithdrawAmount || 0),
+                marginAvailable: a.marginAvailable || false,
+                updateTime: a.updateTime
+            }));
+            
+            results.futuresUsdM = {
+                success: true,
+                totalWalletBalance: parseFloat(futuresAccount.totalWalletBalance),
+                totalUnrealizedProfit: parseFloat(futuresAccount.totalUnrealizedPnl || 0),
+                totalMarginBalance: parseFloat(futuresAccount.totalMarginBalance),
+                totalCrossWalletBalance: parseFloat(futuresAccount.totalCrossWalletBalance || 0),
+                totalCrossUnPnl: parseFloat(futuresAccount.totalCrossUnPnl || 0),
+                availableBalance: parseFloat(futuresAccount.availableBalance || 0),
+                maxWithdrawAmount: parseFloat(futuresAccount.maxWithdrawAmount || 0),
+                assets: futuresAssets,
+                canTrade: futuresAccount.canTrade,
+                canDeposit: futuresAccount.canDeposit,
+                canWithdraw: futuresAccount.canWithdraw,
+                feeTier: futuresAccount.feeTier,
+                maxWithdrawAmount: parseFloat(futuresAccount.maxWithdrawAmount || 0),
+                totalInitialMargin: parseFloat(futuresAccount.totalInitialMargin || 0),
+                totalMaintMargin: parseFloat(futuresAccount.totalMaintMargin || 0),
+                totalOpenOrderInitialMargin: parseFloat(futuresAccount.totalOpenOrderInitialMargin || 0),
+                totalPositionInitialMargin: parseFloat(futuresAccount.totalPositionInitialMargin || 0),
+                updateTime: futuresAccount.updateTime
+            };
+            
+            results.metadata.endpoints_used.push({ endpoint: '/fapi/v2/account', weight: 5 });
+            results.metadata.api_weights_consumed += 5;
+            
+            console.log(`[COMPREHENSIVE] USD-M Futures: $${results.futuresUsdM.totalWalletBalance.toFixed(2)} wallet, $${results.futuresUsdM.availableBalance.toFixed(2)} available`);
+            
+        } catch (error) {
+            // Fallback to /fapi/v2/balance (Weight: 5)
+            try {
+                console.log('[COMPREHENSIVE] Fallback: Trying /fapi/v2/balance (weight: 5)...');
+                const futuresBalances = await futuresClient.futuresAccountBalance();
+                
+                let totalWalletBalance = 0;
+                const processedAssets = futuresBalances.filter(b => 
+                    !omitZeroBalances || parseFloat(b.balance) > 0
+                ).map(b => {
+                    const balance = parseFloat(b.balance);
+                    if (b.asset === 'USDT') totalWalletBalance += balance;
+                    return {
+                        asset: b.asset,
+                        walletBalance: balance,
+                        crossWalletBalance: parseFloat(b.crossWalletBalance || balance),
+                        availableBalance: parseFloat(b.availableBalance || balance),
+                        maxWithdrawAmount: parseFloat(b.maxWithdrawAmount || balance)
+                    };
+                });
+                
+                results.futuresUsdM = {
+                    success: true,
+                    totalWalletBalance: totalWalletBalance,
+                    availableBalance: totalWalletBalance,
+                    assets: processedAssets,
+                    method: 'fallback_balance_endpoint',
+                    note: 'Using /fapi/v2/balance fallback - limited data available'
+                };
+                
+                results.metadata.endpoints_used.push({ endpoint: '/fapi/v2/balance', weight: 5 });
+                results.metadata.api_weights_consumed += 5;
+                
+                console.log(`[COMPREHENSIVE] USD-M Futures (fallback): $${totalWalletBalance.toFixed(2)}`);
+                
+            } catch (fallbackError) {
+                results.futuresUsdM = {
+                    success: false,
+                    error: `Primary: ${error.message}, Fallback: ${fallbackError.message}`
+                };
+                console.log(`[COMPREHENSIVE] Both USD-M futures endpoints failed`);
+            }
+        }
+
+        // 3. Cross Margin usando /sapi/v1/margin/account (Weight: 10)
+        try {
+            console.log('[COMPREHENSIVE] Fetching Cross Margin (/sapi/v1/margin/account, weight: 10)...');
+            const marginAccount = await spotClient.marginAccountInfo();
+            
+            let marginTotalUSDT = 0;
+            const marginBalances = {};
+            
+            if (marginAccount.userAssets) {
+                const prices = await spotClient.prices();
+                
+                for (const asset of marginAccount.userAssets) {
+                    const free = parseFloat(asset.free);
+                    const locked = parseFloat(asset.locked);
+                    const borrowed = parseFloat(asset.borrowed || 0);
+                    const interest = parseFloat(asset.interest || 0);
+                    const netAsset = parseFloat(asset.netAsset || 0);
+                    
+                    if (!omitZeroBalances || (free + locked + borrowed) > 0) {
+                        marginBalances[asset.asset] = {
+                            free,
+                            locked,
+                            borrowed,
+                            interest,
+                            netAsset,
+                            total: free + locked
+                        };
+                        
+                        // Convert to USDT value
+                        if (asset.asset === 'USDT') {
+                            marginTotalUSDT += netAsset;
+                        } else if (netAsset !== 0) {
+                            const pairPrice = prices[`${asset.asset}USDT`];
+                            if (pairPrice) {
+                                const usdtValue = netAsset * parseFloat(pairPrice);
+                                marginTotalUSDT += usdtValue;
+                                marginBalances[asset.asset].usdtValue = usdtValue;
+                                marginBalances[asset.asset].price = parseFloat(pairPrice);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            results.margin = {
+                success: true,
+                balances: marginBalances,
+                totalUSDTValue: marginTotalUSDT,
+                totalAssetOfBtc: parseFloat(marginAccount.totalAssetOfBtc || 0),
+                totalLiabilityOfBtc: parseFloat(marginAccount.totalLiabilityOfBtc || 0),
+                totalNetAssetOfBtc: parseFloat(marginAccount.totalNetAssetOfBtc || 0),
+                marginLevel: parseFloat(marginAccount.marginLevel || 0),
+                indexPrice: parseFloat(marginAccount.indexPrice || 0),
+                marginRatio: parseFloat(marginAccount.marginRatio || 0),
+                tradeEnabled: marginAccount.tradeEnabled,
+                transferEnabled: marginAccount.transferEnabled,
+                borrowEnabled: marginAccount.borrowEnabled,
+                repayEnabled: marginAccount.repayEnabled
+            };
+            
+            results.metadata.endpoints_used.push({ endpoint: '/sapi/v1/margin/account', weight: 10 });
+            results.metadata.api_weights_consumed += 10;
+            
+            console.log(`[COMPREHENSIVE] Cross Margin: $${marginTotalUSDT.toFixed(2)} USDT net asset`);
+            
+        } catch (error) {
+            results.margin = {
+                success: false,
+                error: error.message
+            };
+            console.log(`[COMPREHENSIVE] Margin error: ${error.message}`);
+        }
+
+        // 4. Calculate comprehensive totals
+        const spotValue = results.spot?.totalUSDTValue || 0;
+        const futuresValue = results.futuresUsdM?.totalWalletBalance || 0;
+        const marginValue = results.margin?.totalUSDTValue || 0;
+        const futuresAvailable = results.futuresUsdM?.availableBalance || 0;
+        const futuresUnrealizedPnL = results.futuresUsdM?.totalUnrealizedProfit || 0;
+        const futuresMarginBalance = results.futuresUsdM?.totalMarginBalance || 0;
+        
+        results.total = {
+            totalWalletBalance: spotValue + futuresValue + marginValue,
+            totalAvailableBalance: spotValue + futuresAvailable + marginValue,
+            totalUnrealizedProfit: futuresUnrealizedPnL,
+            totalMarginBalance: futuresMarginBalance,
+            breakdown: {
+                spot: {
+                    value: spotValue,
+                    percentage: ((spotValue / (spotValue + futuresValue + marginValue)) * 100) || 0
+                },
+                futures: {
+                    value: futuresValue,
+                    available: futuresAvailable,
+                    percentage: ((futuresValue / (spotValue + futuresValue + marginValue)) * 100) || 0
+                },
+                margin: {
+                    value: marginValue,
+                    percentage: ((marginValue / (spotValue + futuresValue + marginValue)) * 100) || 0
+                }
+            }
+        };
+
+        console.log(`[COMPREHENSIVE] TOTAL COMPREHENSIVE BALANCE: $${results.total.totalWalletBalance.toFixed(2)} USDT`);
+        console.log(`[COMPREHENSIVE] API Weights consumed: ${results.metadata.api_weights_consumed} (Limit: 1200/min for IP, 180,000/min for UID)`);
+
+        res.json({
+            success: true,
+            message: `Comprehensive balance calculated: $${results.total.totalWalletBalance.toFixed(2)} USDT`,
+            totalBalance: results.total.totalWalletBalance,
+            totalAvailableBalance: results.total.totalAvailableBalance,
+            totalUnrealizedProfit: results.total.totalUnrealizedProfit,
+            totalMarginBalance: results.total.totalMarginBalance,
+            breakdown: results.total.breakdown,
+            details: results,
+            metadata: results.metadata,
+            timestamp: new Date().toISOString(),
+            technical_info: {
+                note: 'Using Binance technical endpoints as per API documentation',
+                endpoints_reference: {
+                    spot: '/api/v3/account (Weight: 20)',
+                    futures_primary: '/fapi/v2/account (Weight: 5)',
+                    futures_fallback: '/fapi/v2/balance (Weight: 5)',
+                    margin: '/sapi/v1/margin/account (Weight: 10)'
+                },
+                rate_limits: {
+                    ip_limit: '1200 weight per minute',
+                    uid_limit: '180,000 weight per minute'
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error('[COMPREHENSIVE] Comprehensive balance calculation failed:', error.message);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to calculate comprehensive balance',
+            error: error.message,
+            metadata: results.metadata
+        });
+    }
+});
+
+app.listen(PORT, async () => {
     console.log(`Backend server is running on http://localhost:${PORT}`);
     console.log('🎯 Funding Rate Arbitrage Engine: ACTIVE');
+    
+    // Start MarketDataService for real-time funding rates
+    console.log('🚀 Starting Market Data Service...');
+    try {
+        await marketDataService.start();
+        console.log('✅ Market Data Service: CONNECTED');
+    } catch (error) {
+        console.error('❌ Market Data Service failed to start:', error.message);
+    }
+    
     console.log('📊 API Endpoints:');
     console.log('   GET /api/v1/funding-rates - All funding rates');
     console.log('   GET /api/v1/arbitrage-opportunities - Trading opportunities');
     console.log('   GET /api/v1/funding-rates/:symbol - Symbol-specific data');
     console.log('   POST /api/v1/funding-rates/refresh - Force refresh');
     console.log('   GET /api/v1/funding-rates/monitor-status - Monitor status');
+    console.log('   GET /api/v1/market-data/status - Real-time market data status');
+    console.log('   GET /api/v1/market-data/funding-rates - Real-time funding rates');
+    console.log('   GET /api/v1/market-data/funding-rates/:symbol - Real-time symbol data');
+});
+
+// Graceful shutdown handling
+process.on('SIGINT', async () => {
+    console.log('\n🛑 Shutting down server gracefully...');
+    
+    try {
+        console.log('📊 Stopping Market Data Service...');
+        await marketDataService.stop();
+        console.log('✅ Market Data Service stopped');
+    } catch (error) {
+        console.error('❌ Error stopping Market Data Service:', error.message);
+    }
+    
+    console.log('👋 Server shutdown complete');
+    process.exit(0);
 });

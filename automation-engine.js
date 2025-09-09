@@ -22,15 +22,15 @@ class AutomationEngine {
                 enabled: true,
                 minFundingRate: 0.0002, // 0.02% minimum
                 minLiquidity: 1000000,  // $1M minimum
-                maxConcurrentBots: 3,
-                minInvestment: 10,
+                maxConcurrentBots: 1,
+                minInvestment: 2,
                 defaultLeverage: 3
             },
             
             // Portfolio management
             portfolio: {
-                totalCapital: 55,       // $55 total available (based on real balance)
-                maxPerBot: 25,          // $25 max per bot (adjusted)
+                totalCapital: 7,        // $7 total available (micro-capital mode)
+                maxPerBot: 2,           // $2 max per bot (micro-capital)
                 rebalanceThreshold: 0.25, // 25% performance difference
                 diversificationLimit: 2  // Max 2 bots per asset class
             },
@@ -67,6 +67,18 @@ class AutomationEngine {
         this.intervals = new Map();
         this.isRunning = false;
         
+        // Environment overrides for runtime configuration
+        const num = k => process.env[k] ? Number(process.env[k]) : undefined;
+        const ovMinInv = num('ENGINE_MIN_INVESTMENT');
+        const ovMaxBots = num('ENGINE_MAX_CONCURRENT_BOTS');
+        const ovMinFR = num('ENGINE_MIN_FUNDING_RATE');
+        const ovMinLiq = num('ENGINE_MIN_LIQUIDITY');
+        
+        if (ovMinInv) this.config.autoLaunch.minInvestment = ovMinInv;
+        if (ovMaxBots) this.config.autoLaunch.maxConcurrentBots = ovMaxBots;
+        if (ovMinFR) this.config.autoLaunch.minFundingRate = ovMinFR;
+        if (ovMinLiq) this.config.autoLaunch.minLiquidity = ovMinLiq;
+        
         console.log('🤖 Automation Engine initialized');
     }
     
@@ -96,12 +108,17 @@ class AutomationEngine {
             console.log(`   Total Available: $${totalUSDT.toFixed(2)}`);
             
             // Update configuration with real capital
-            if (totalUSDT > 10) { // Only update if we have reasonable amount
+            if (totalUSDT > 1) { // Only update if we have reasonable amount (lowered for micro-capital)
                 const adjustedTotal = Math.floor(totalUSDT * 0.9); // Use 90% for safety
                 const adjustedMaxPerBot = Math.floor(adjustedTotal / 3); // Allow up to 3 bots
                 
                 this.config.portfolio.totalCapital = adjustedTotal;
-                this.config.portfolio.maxPerBot = Math.max(10, adjustedMaxPerBot); // Minimum $10 per bot
+                this.config.portfolio.maxPerBot = Math.max(1, Math.floor(adjustedTotal / Math.max(1, this.config.autoLaunch.maxConcurrentBots)));
+                
+                // Ensure minInvestment fits tiny balances
+                if (this.config.autoLaunch.minInvestment && this.config.autoLaunch.minInvestment > this.config.portfolio.maxPerBot) {
+                    this.config.autoLaunch.minInvestment = this.config.portfolio.maxPerBot;
+                }
                 
                 console.log(`⚙️ Updated Portfolio Config:`);
                 console.log(`   Total Capital: $${adjustedTotal} (90% of available)`);
@@ -253,10 +270,8 @@ class AutomationEngine {
     async autoLaunchBot(opportunity) {
         try {
             const strategy = opportunity.fundingRate < 0 ? 'Short Perp' : 'Long Perp';
-            const investment = Math.min(
-                this.config.autoLaunch.minInvestment,
-                this.config.portfolio.maxPerBot
-            );
+            const perBotCap = Math.max(1, Math.floor(this.config.portfolio.totalCapital / Math.max(1, this.config.autoLaunch.maxConcurrentBots)));
+            const investment = Math.max(this.config.autoLaunch.minInvestment, Math.min(this.config.portfolio.maxPerBot, perBotCap));
             
             console.log(`🚀 AUTO-LAUNCHING: ${opportunity.symbol} ${strategy}`);
             console.log(`   Funding Rate: ${(opportunity.fundingRate * 100).toFixed(4)}%`);
@@ -634,6 +649,21 @@ class AutomationEngine {
             return [];
         } catch (error) {
             console.error('Failed to get opportunities:', error.message);
+            
+            // Fallback: get opportunities directly from Binance
+            try {
+                const mp = await this.client.futuresMarkPrice();
+                const top = mp.filter(m => m.symbol.endsWith('USDT')).map(m => ({ 
+                    symbol: m.symbol, 
+                    fundingRate: parseFloat(m.lastFundingRate), 
+                    liquidity: 5000000, 
+                    annualizedRate: ((parseFloat(m.lastFundingRate) * 3 * 365) * 100).toFixed(2) 
+                })).sort((a,b) => Math.abs(b.fundingRate) - Math.abs(a.fundingRate)).slice(0,5);
+                if (top.length) return top;
+            } catch (fallbackError) {
+                console.error('Fallback opportunities also failed:', fallbackError.message);
+            }
+            
             return [];
         }
     }

@@ -182,8 +182,15 @@ class AutoBalanceManager {
     
     async analyzeFundingOpportunities() {
         try {
-            // Get funding rates for all symbols (no parameters needed for all symbols)
-            const fundingRates = await this.client.futuresFundingRate({});
+            // Get funding rates for all symbols - use premiumIndex instead
+            const premiumIndexResponse = await this.client.futuresPremiumIndex();
+            
+            // Convert premium index to funding rate format
+            const fundingRates = premiumIndexResponse.map(item => ({
+                symbol: item.symbol,
+                fundingRate: parseFloat(item.lastFundingRate || '0').toString(),
+                fundingTime: item.nextFundingTime
+            }));
             
             const opportunities = {
                 highPotential: [], // >0.15% funding rate

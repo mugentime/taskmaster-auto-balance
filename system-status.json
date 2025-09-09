@@ -1,8 +1,8 @@
 {
-  "lastCheck": "2025-09-05T18:09:09.350Z",
+  "lastCheck": "2025-09-05T19:55:10.256Z",
   "isHealthy": false,
-  "consecutiveFailures": 42,
+  "consecutiveFailures": 148,
   "maxFailures": 3,
-  "uptime": 2863955,
+  "uptime": 9224860,
   "startTime": 1757092885396
 }

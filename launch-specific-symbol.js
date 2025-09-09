@@ -10,7 +10,8 @@ async function launchSpecificSymbol(symbol, investment = 10, leverage = 3) {
     const client = Binance({
         apiKey: process.env.BINANCE_API_KEY,
         apiSecret: process.env.BINANCE_API_SECRET,
-        testnet: false
+        testnet: false,
+        getTime: () => Date.now() - 2000 // Subtract 2 seconds to fix timestamp issues
     });
     
     try {
@@ -92,11 +93,15 @@ async function launchSpecificSymbol(symbol, investment = 10, leverage = 3) {
                 leverage: leverage
             });
             
+            // Calculate quantity for Long Perp
+            const markPrice = parseFloat(symbolData.markPrice);
+            const quantity = ((investment * leverage) / markPrice).toFixed(6);
+            
             await client.futuresOrder({
                 symbol: symbol,
                 side: 'BUY',
                 type: 'MARKET',
-                quoteOrderQty: (investment * leverage).toString()
+                quantity: quantity
             });
             
             console.log(`   ✅ Longed ${symbol}`);
