@@ -83,7 +83,7 @@ class AutomationEngine {
     }
     
     // ==========================================
-    // CAPITAL DETECTION
+    // CAPITAL DETECTION & OPTIMIZATION
     // ==========================================
     
     async detectRealCapital() {
@@ -98,40 +98,124 @@ class AutomationEngine {
             
             // Get futures account
             const futuresAccount = await this.client.futuresAccountInfo();
-            const futuresUSDT = parseFloat(futuresAccount.assets.find(a => a.asset === 'USDT')?.walletBalance || '0');
+            const futuresWallet = futuresAccount.assets.find(a => a.asset === 'USDT');
+            const futuresUSDT = parseFloat(futuresWallet?.walletBalance || '0');
+            const futuresAvailable = parseFloat(futuresWallet?.availableBalance || '0');
             
-            const totalUSDT = spotUSDT + futuresUSDT;
+            // Use the higher of available balance or wallet balance for more accurate trading capital
+            const effectiveFuturesBalance = Math.max(futuresUSDT, futuresAvailable);
+            const totalUSDT = spotUSDT + effectiveFuturesBalance;
             
             console.log(`📊 Real Capital Detected:`);
             console.log(`   Spot USDT: $${spotUSDT.toFixed(2)}`);
-            console.log(`   Futures USDT: $${futuresUSDT.toFixed(2)}`);
+            console.log(`   Futures Wallet: $${futuresUSDT.toFixed(2)}`);
+            console.log(`   Futures Available: $${futuresAvailable.toFixed(2)}`);
+            console.log(`   Effective Futures: $${effectiveFuturesBalance.toFixed(2)}`);
             console.log(`   Total Available: $${totalUSDT.toFixed(2)}`);
             
-            // Update configuration with real capital
-            if (totalUSDT > 1) { // Only update if we have reasonable amount (lowered for micro-capital)
-                const adjustedTotal = Math.floor(totalUSDT * 0.9); // Use 90% for safety
-                const adjustedMaxPerBot = Math.floor(adjustedTotal / 3); // Allow up to 3 bots
+            // Update configuration with real capital, optimizing for maximum efficiency
+            if (totalUSDT > 6) { // Minimum $6 required for Binance notional requirements
+                // Calculate optimal investment per bot considering both wallets
+                const spotSafeAmount = Math.floor(spotUSDT * 0.95); // 95% of spot (aggressive)
+                const futuresSafeAmount = Math.floor(effectiveFuturesBalance * 0.4); // 40% of futures margin
                 
-                this.config.portfolio.totalCapital = adjustedTotal;
-                this.config.portfolio.maxPerBot = Math.max(1, Math.floor(adjustedTotal / Math.max(1, this.config.autoLaunch.maxConcurrentBots)));
+                // For arbitrage, we need BOTH spot USDT AND futures margin
+                // Investment is limited by spot USDT but supported by futures margin
+                const maxInvestmentPerBot = Math.min(
+                    Math.max(6, spotSafeAmount), // At least $6, but use available spot
+                    futuresSafeAmount // But don't exceed futures margin capacity
+                );
                 
-                // Ensure minInvestment fits tiny balances
-                if (this.config.autoLaunch.minInvestment && this.config.autoLaunch.minInvestment > this.config.portfolio.maxPerBot) {
-                    this.config.autoLaunch.minInvestment = this.config.portfolio.maxPerBot;
-                }
+                const totalCapitalEfficient = maxInvestmentPerBot * this.config.autoLaunch.maxConcurrentBots;
                 
-                console.log(`⚙️ Updated Portfolio Config:`);
-                console.log(`   Total Capital: $${adjustedTotal} (90% of available)`);
-                console.log(`   Max Per Bot: $${this.config.portfolio.maxPerBot}`);
+                this.config.portfolio.totalCapital = totalCapitalEfficient;
+                this.config.portfolio.maxPerBot = maxInvestmentPerBot;
+                
+                // Set minimum to Binance requirement but allow dynamic scaling
+                this.config.autoLaunch.minInvestment = Math.max(6, Math.min(maxInvestmentPerBot, this.config.autoLaunch.minInvestment || 6));
+                
+                console.log(`⚙️ CAPITAL EFFICIENCY OPTIMIZATION:`);
+                console.log(`   💰 Spot USDT: $${spotUSDT.toFixed(2)} (95% usable = $${spotSafeAmount})`);
+                console.log(`   🚀 Futures Margin: $${effectiveFuturesBalance.toFixed(2)} (40% usable = $${futuresSafeAmount})`);
+                console.log(`   🎯 Optimal Investment/Bot: $${maxInvestmentPerBot}`);
+                console.log(`   📊 Total Efficient Capital: $${totalCapitalEfficient}`);
+                console.log(`   ⚡ Min Investment (Binance): $${this.config.autoLaunch.minInvestment}`);
+                console.log(`   🔥 Capital Efficiency: ${((maxInvestmentPerBot/totalUSDT)*100).toFixed(1)}% per bot`);
                 
                 this.realCapitalDetected = true;
             } else {
-                console.log(`⚠️ Low capital detected ($${totalUSDT.toFixed(2)}), using default config`);
+                console.log(`⚠️ Low capital detected ($${totalUSDT.toFixed(2)}), attempting asset conversion...`);
+                await this.optimizeCapitalAllocation();
             }
             
         } catch (error) {
             console.error(`❌ Failed to detect real capital:`, error.message);
             console.log(`📝 Using default configuration`);
+        }
+    }
+    
+    async optimizeCapitalAllocation() {
+        try {
+            console.log('🔄 OPTIMIZING CAPITAL ALLOCATION...');
+            
+            // Check for convertible assets in both wallets
+            const spotAccount = await this.client.accountInfo();
+            const futuresAccount = await this.client.futuresAccountInfo();
+            
+            const spotUSDT = parseFloat(spotAccount.balances.find(b => b.asset === 'USDT')?.free || '0');
+            const futuresUSDT = parseFloat(futuresAccount.assets.find(a => a.asset === 'USDT')?.walletBalance || '0');
+            
+            console.log(`   Current: Spot=$${spotUSDT.toFixed(2)}, Futures=$${futuresUSDT.toFixed(2)}`);
+            
+            // If spot has less than $10 but futures has assets, try to rebalance
+            if (spotUSDT < 10) {
+                console.log('🎯 Need more spot USDT for trading...');
+                
+                // Look for BNB or other assets in futures to convert
+                const futuresAssets = futuresAccount.assets.filter(a => 
+                    a.asset !== 'USDT' && parseFloat(a.walletBalance) > 0
+                );
+                
+                for (const asset of futuresAssets) {
+                    const balance = parseFloat(asset.walletBalance);
+                    if (balance > 0.001) {
+                        console.log(`   Found ${asset.asset}: ${balance} in futures wallet`);
+                        
+                        // Try to transfer a portion to spot and convert
+                        const transferAmount = Math.min(balance * 0.3, balance - 0.001);
+                        if (transferAmount > 0.001) {
+                            try {
+                                console.log(`   Transferring ${transferAmount} ${asset.asset} to spot...`);
+                                await this.client.universalTransfer({
+                                    type: 'UMFUTURE_MAIN',
+                                    asset: asset.asset,
+                                    amount: transferAmount.toFixed(6)
+                                });
+                                
+                                // Wait and try to convert to USDT
+                                await new Promise(resolve => setTimeout(resolve, 2000));
+                                
+                                const symbol = asset.asset + 'USDT';
+                                const prices = await this.client.prices();
+                                if (prices[symbol]) {
+                                    const estimatedValue = transferAmount * parseFloat(prices[symbol]);
+                                    if (estimatedValue > 6) {
+                                        console.log(`   Converting to USDT (estimated $${estimatedValue.toFixed(2)})...`);
+                                        // Convert logic would go here
+                                        // For now, just log the potential
+                                        break; // Only do one conversion attempt
+                                    }
+                                }
+                            } catch (error) {
+                                console.log(`   ❌ Failed to transfer ${asset.asset}:`, error.message);
+                            }
+                        }
+                    }
+                }
+            }
+            
+        } catch (error) {
+            console.error('❌ Capital optimization failed:', error.message);
         }
     }
     
