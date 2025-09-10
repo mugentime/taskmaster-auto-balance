@@ -219,6 +219,71 @@ class AutomationEngine {
         }
     }
     
+    async detectExistingBots() {
+        try {
+            console.log('🔍 Scanning for existing active bots...');
+            
+            // Get all futures positions
+            const positions = await this.client.futuresPositionRisk();
+            const activePositions = positions.filter(p => Math.abs(parseFloat(p.positionAmt)) > 0);
+            
+            // Get spot balances
+            const spotAccount = await this.client.accountInfo();
+            
+            let detectedCount = 0;
+            
+            for (const position of activePositions) {
+                const symbol = position.symbol;
+                const baseAsset = symbol.replace('USDT', '');
+                const positionAmt = parseFloat(position.positionAmt);
+                
+                // Check if we have corresponding spot balance (indicating arbitrage)
+                const spotBalance = spotAccount.balances.find(b => b.asset === baseAsset);
+                const spotAmount = spotBalance ? parseFloat(spotBalance.free) : 0;
+                
+                // If we have both futures position and spot balance, it's likely our bot
+                if (spotAmount > 0 && Math.abs(positionAmt) > 0) {
+                    const strategy = positionAmt < 0 ? 'Short Perp' : 'Long Perp';
+                    const notionalValue = Math.abs(positionAmt * parseFloat(position.markPrice));
+                    
+                    const botId = `detected-${symbol.toLowerCase()}-${Date.now()}`;
+                    
+                    this.state.activeBots.set(botId, {
+                        id: botId,
+                        name: `Detected ${symbol} ${strategy} Bot`,
+                        symbol: symbol,
+                        strategyType: strategy,
+                        investment: notionalValue,
+                        leverage: 3, // Assume default
+                        autoManaged: false,
+                        autoLaunched: false,
+                        launchedAt: new Date().toISOString(),
+                        expectedFunding: 0,
+                        startTime: Date.now() - (24 * 60 * 60 * 1000), // Assume 24h old
+                        currentFundingRate: 0,
+                        totalEarnings: 0,
+                        status: 'active',
+                        detected: true,
+                        futuresPosition: positionAmt,
+                        spotBalance: spotAmount
+                    });
+                    
+                    detectedCount++;
+                    console.log(`   ✅ Detected: ${symbol} ${strategy} (${Math.abs(positionAmt).toFixed(6)} futures, ${spotAmount.toFixed(6)} spot)`);
+                }
+            }
+            
+            if (detectedCount > 0) {
+                console.log(`🎉 Successfully detected ${detectedCount} existing bot(s)`);
+            } else {
+                console.log(`💭 No existing arbitrage bots detected`);
+            }
+            
+        } catch (error) {
+            console.error('❌ Failed to detect existing bots:', error.message);
+        }
+    }
+    
     // ==========================================
     // MAIN AUTOMATION METHODS
     // ==========================================
@@ -240,6 +305,9 @@ class AutomationEngine {
         this.startPortfolioManager();
         this.startHealthMonitor();
         this.startRiskManager();
+        
+        // Detect existing active bots first
+        await this.detectExistingBots();
         
         // Initial scan
         await this.scanAndLaunch();
@@ -354,13 +422,26 @@ class AutomationEngine {
     async autoLaunchBot(opportunity) {
         try {
             const strategy = opportunity.fundingRate < 0 ? 'Short Perp' : 'Long Perp';
-            const perBotCap = Math.max(1, Math.floor(this.config.portfolio.totalCapital / Math.max(1, this.config.autoLaunch.maxConcurrentBots)));
-            const investment = Math.max(this.config.autoLaunch.minInvestment, Math.min(this.config.portfolio.maxPerBot, perBotCap));
+            
+            // REAL-TIME BALANCE CHECK before launch
+            const balanceCheck = await this.verifyBalancesForLaunch(opportunity);
+            if (!balanceCheck.canLaunch) {
+                console.log(`❌ Cannot launch ${opportunity.symbol}: ${balanceCheck.reason}`);
+                return {
+                    action: 'launch',
+                    result: 'failed',
+                    error: balanceCheck.reason,
+                    opportunity
+                };
+            }
+            
+            const investment = balanceCheck.recommendedInvestment;
             
             console.log(`🚀 AUTO-LAUNCHING: ${opportunity.symbol} ${strategy}`);
             console.log(`   Funding Rate: ${(opportunity.fundingRate * 100).toFixed(4)}%`);
-            console.log(`   Investment: $${investment}`);
+            console.log(`   Investment: $${investment} (verified available)`);
             console.log(`   Expected APY: ${opportunity.annualizedRate}%`);
+            console.log(`   ✅ Balance verification: PASSED`);
             
             const botConfig = {
                 id: `auto-${opportunity.symbol.toLowerCase()}-${Date.now()}`,
@@ -726,28 +807,73 @@ class AutomationEngine {
     
     async getOpportunities() {
         try {
-            const response = await axios.get('http://localhost:3001/api/v1/arbitrage-opportunities');
-            if (response.data.success && response.data.opportunities) {
-                return response.data.opportunities;
+            console.log('🔍 Scanning for dynamic trading opportunities...');
+            
+            // Get current balances
+            const spotAccount = await this.client.accountInfo();
+            const futuresAccount = await this.client.futuresAccountInfo();
+            const spotUSDT = parseFloat(spotAccount.balances.find(b => b.asset === 'USDT')?.free || '0');
+            const futuresAvailable = parseFloat(futuresAccount.assets.find(a => a.asset === 'USDT')?.availableBalance || '0');
+            
+            // Get all funding rates
+            const markPrices = await this.client.futuresMarkPrice();
+            const prices = await this.client.prices();
+            
+            const viableOpportunities = [];
+            
+            for (const mp of markPrices) {
+                if (!mp.symbol.endsWith('USDT')) continue;
+                
+                const symbol = mp.symbol;
+                const baseAsset = symbol.replace('USDT', '');
+                const fundingRate = parseFloat(mp.lastFundingRate);
+                const price = parseFloat(prices[symbol] || mp.markPrice);
+                
+                // Skip if funding rate too low
+                if (Math.abs(fundingRate) < this.config.autoLaunch.minFundingRate) continue;
+                
+                // Check if we can afford this trade
+                const minInvestment = this.config.autoLaunch.minInvestment;
+                const canAffordSpot = spotUSDT >= minInvestment;
+                const canAffordFutures = futuresAvailable >= (minInvestment * 0.5); // 50% margin requirement
+                
+                if (!canAffordSpot || !canAffordFutures) continue;
+                
+                // Check if we already have a position in this symbol
+                const isAlreadyActive = [...this.state.activeBots.values()].some(bot => bot.symbol === symbol);
+                if (isAlreadyActive) continue;
+                
+                // Calculate liquidity score (estimate based on price and volume)
+                const estimatedLiquidity = price * 1000000; // Rough estimate
+                
+                viableOpportunities.push({
+                    symbol: symbol,
+                    baseAsset: baseAsset,
+                    fundingRate: fundingRate,
+                    price: price,
+                    liquidity: estimatedLiquidity,
+                    annualizedRate: ((Math.abs(fundingRate) * 3 * 365) * 100).toFixed(2),
+                    canAfford: true,
+                    requiredUSDT: minInvestment,
+                    availableSpotUSDT: spotUSDT,
+                    availableFuturesMargin: futuresAvailable
+                });
             }
-            return [];
+            
+            // Sort by absolute funding rate (best opportunities first)
+            viableOpportunities.sort((a, b) => Math.abs(b.fundingRate) - Math.abs(a.fundingRate));
+            
+            console.log(`   Found ${viableOpportunities.length} viable opportunities`);
+            if (viableOpportunities.length > 0) {
+                console.log(`   Top 3: ${viableOpportunities.slice(0, 3).map(o => 
+                    `${o.symbol}(${(o.fundingRate*100).toFixed(3)}%)`
+                ).join(', ')}`);
+            }
+            
+            return viableOpportunities.slice(0, 10); // Return top 10
+            
         } catch (error) {
-            console.error('Failed to get opportunities:', error.message);
-            
-            // Fallback: get opportunities directly from Binance
-            try {
-                const mp = await this.client.futuresMarkPrice();
-                const top = mp.filter(m => m.symbol.endsWith('USDT')).map(m => ({ 
-                    symbol: m.symbol, 
-                    fundingRate: parseFloat(m.lastFundingRate), 
-                    liquidity: 5000000, 
-                    annualizedRate: ((parseFloat(m.lastFundingRate) * 3 * 365) * 100).toFixed(2) 
-                })).sort((a,b) => Math.abs(b.fundingRate) - Math.abs(a.fundingRate)).slice(0,5);
-                if (top.length) return top;
-            } catch (fallbackError) {
-                console.error('Fallback opportunities also failed:', fallbackError.message);
-            }
-            
+            console.error('Failed to get dynamic opportunities:', error.message);
             return [];
         }
     }
