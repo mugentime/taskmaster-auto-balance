@@ -4,7 +4,7 @@
   "description": "TaskMaster - Automated Balance Management System for Trading Bots",
   "main": "enhanced-taskmaster.js",
   "scripts": {
-    "start": "node enhanced-taskmaster.js",
+    "start": "node server.js",
     "dev": "node enhanced-taskmaster.js --fast",
     "server": "node server.js",
     "balance-check": "node auto-balance-manager.js",
